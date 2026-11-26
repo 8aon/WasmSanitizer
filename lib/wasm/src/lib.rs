@@ -42,6 +42,11 @@ impl lowlevel::Module {
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> io::Result<usize> {
         self.encode(&mut BufWriter::new(File::create(path)?))
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let mut state = DecodeState::new();
+        Self::decode(&mut io::Cursor::new(bytes), &mut state)
+    }
 }
 
 impl highlevel::Module {
@@ -53,6 +58,10 @@ impl highlevel::Module {
     pub fn from_file_with_offsets<P: AsRef<Path>>(path: P) -> Result<(Self, Offsets), Error> {
         let (module, offsets) = lowlevel::Module::from_file_with_offsets(path)?;
         Ok((module.into(), offsets))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(lowlevel::Module::from_bytes(bytes)?.into())
     }
 
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> io::Result<usize> {

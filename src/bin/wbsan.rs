@@ -9,9 +9,9 @@ macro_rules! log_error {
     }};
 }
 fn main() {
-    let matches = App::new("Test")
+    let matches = App::new("wbsan")
         .version("1.0")
-        .about("testtestestsetset")
+        .about("Patched Version of wbsan")
         .arg(
             Arg::with_name("INPUT")
                 .help("Sets the input file to use")
@@ -53,11 +53,11 @@ fn main() {
         input,
         output,
         ),
-    "non_return" =>  
+/*    "non_return" =>  does not work.
         wasm_instrumenter::test::non_return(
         input,
         output,
-        ),
+        ),*/
     "implicit_integer_sign_change" =>  
         wasm_instrumenter::test::implicit_integer_sign_change(
         input,
@@ -105,12 +105,22 @@ fn main() {
         );
     },
     "all" => {
-        wasm_instrumenter::test::shift(input,output);
         wasm_instrumenter::test::null_reference(input,output);
-        wasm_instrumenter::test::signed_integer_overflow(input,output);
-        wasm_instrumenter::test::float_cast_overflow(input,output);
-        wasm_instrumenter::test::float_divide_by_zero(input,output);
-        wasm_instrumenter::test::implicit_signed_integer_truncation(input,output);
+        wasm_instrumenter::test::implicit_signed_integer_truncation(output,output);
+        wasm_instrumenter::test::implicit_unsigned_integer_truncation(output,output);
+        wasm_instrumenter::test::float_cast_overflow(output,output);
+        //wasm_instrumenter::test::non_return(output,output); doesnt work. Ignore.
+        // Not part of `all`: implicit_integer_sign_change and unsigned_integer_overflow trap on
+        // correct code by design (unsigned chars >= 128, intentional unsigned wraparound), since a
+        // Wasm binary does not tell whether a value is signed or unsigned. Still available as
+        // standalone modes.
+        //wasm_instrumenter::test::implicit_integer_sign_change(output,output);
+        wasm_instrumenter::test::shift(output,output);
+        //wasm_instrumenter::test::unsigned_integer_overflow(output,output);
+        wasm_instrumenter::test::signed_integer_overflow(output,output);
+        wasm_instrumenter::test::float_divide_by_zero(output,output);
+        wasm_instrumenter::test::instrument_with_heap_canary_check(output,output);
+        wasm_instrumenter::test::instrument_with_stack_canary_check(output, output);
     },
         _ => println!("No func matched!")
     }

@@ -13,10 +13,13 @@ use wasm::highlevel::{Global, GlobalOp, Instr, LoadOp, LocalOp, Module, Function
     Local, ImportOrPresent, StoreOp};
 use wasm::{BlockType, FunctionType, Idx, Label, Memarg, Mutability, Val, ValType};
 
-const SIGNED_INTEGER_OVERFLOW_FUNCS_PATH: &str =
-concat!(env!("CARGO_MANIFEST_DIR"), "/funcs/signed_integer_overflow.wasm");
-const SIGNED_INTEGER_OVERFLOW_FUNCS_PATH_MUL: &str =
-concat!(env!("CARGO_MANIFEST_DIR"), "/funcs/mul_check.wasm");
+// The helper functions are embedded into the instrumenter binary at compile time, so that it does
+// not depend on the funcs/ directory existing at runtime (e.g. when running it in a container or
+// from a different checkout location).
+const SIGNED_INTEGER_OVERFLOW_FUNCS_WASM: &[u8] =
+include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/funcs/signed_integer_overflow.wasm"));
+const SIGNED_INTEGER_OVERFLOW_FUNCS_WASM_MUL: &[u8] =
+include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/funcs/mul_check.wasm"));
 const SIGNED_INTEGER_OVERFLOW_FUNCS: [&str; 6] = 
 ["is_i32_sign_add_overflow","is_i64_sign_add_overflow",
 "is_i32_sign_sub_overflow","is_i64_sign_sub_overflow",
@@ -47,8 +50,8 @@ fn is_string_in_ini_funcs(option_string: &Option<String>) -> bool {
     false
 }
 
-fn copy_function(func_name: &str, target_module: &mut Module, source_path: &str) -> Result<Idx<Function>, ()>{
-    let s_module = Module::from_file(source_path);
+fn copy_function(func_name: &str, target_module: &mut Module, source_wasm: &[u8]) -> Result<Idx<Function>, ()>{
+    let s_module = Module::from_bytes(source_wasm);
     if let Ok(source_module) = s_module{
         let function_to_move = source_module.functions()
        .find(|f| f.1.name == Some(func_name.to_string()))
@@ -88,8 +91,9 @@ pub fn copy_function_test(){
     let source_path = "/home/WORK/fuzzm-project/wasm_instrumenter/funcs/signed_integer_overflow.wasm";
     let target_path = "/home/WORK/demo.wasm";
     let mut target_module = Module::from_file(target_path).unwrap();
-    let _ = copy_function(func_name1,&mut target_module,source_path);
-    let _ = copy_function(func_name2,&mut target_module,source_path);
+    let source = std::fs::read(source_path).expect("Fail to read the source module!");
+    let _ = copy_function(func_name1,&mut target_module,&source);
+    let _ = copy_function(func_name2,&mut target_module,&source);
     let _ = target_module.to_file("/home/WORK/demo_ins.wasm").unwrap();
 }
 
@@ -131,6 +135,19 @@ pub fn add_proc_exit(input: &str, output: &str) -> Option<Idx<Function>> {
     }
 }
 
+/// Lowest address initialized by a data segment, i.e., where static data starts. Falls back to 1024,
+/// the default start of static data with wasm-ld (--global-base), if there are no data segments.
+fn lowest_static_data_address(module: &Module) -> u32 {
+    module.memories()
+        .flat_map(|(_, mem)| mem.data.iter())
+        .filter_map(|data| match data.offset.first() {
+            Some(Instr::Const(Val::I32(addr))) => Some(*addr as u32),
+            _ => None,
+        })
+        .min()
+        .unwrap_or(1024)
+}
+
 pub fn null_reference(input: &str, output: &str) {
     let result = Module::from_file(input);
     let mut proc_exit_idx: Idx<Function> = Idx::<Function>::from(0);
@@ -145,6 +162,11 @@ pub fn null_reference(input: &str, output: &str) {
                 },
             }
         }
+        // A store `local.get p; local.get v; store offset=K` with a large K usually accesses a
+        // static array at address K, with p being an index (which can legitimately be 0), not a
+        // pointer. Only stores whose offset is below the lowest static data address are treated as
+        // potential NULL dereferences (`p->field` has a small field offset).
+        let null_check_offset_limit = lowest_static_data_address(&module);
         for (_, func) in module.functions_mut() {
             if let Some(cur_func_name) = &func.name.clone(){
                 if let Some(rest) = cur_func_name.strip_prefix("__"){
@@ -167,7 +189,7 @@ pub fn null_reference(input: &str, output: &str) {
                         match(&code.body[i-2], &code.body[i-1], &code.body[i]){
                             (Instr::Local(LocalOp::Get, idx1), 
                             Instr::Local(LocalOp::Get, idx2),
-                            Instr::Store(..)) => {
+                            Instr::Store(_, memarg)) if memarg.offset < null_check_offset_limit => {
                                 // 在store指令后插入检查local是否为0的指令
                                 let new_local1 = add_fresh_local(&mut code.locals, func_param_count, ValType::I32);
                                 new_instrs.push(Instr::Local(LocalOp::Get, *idx1));
@@ -236,6 +258,10 @@ pub fn implicit_signed_integer_truncation(input: &str, output: &str) {
                         new_instrs.push(code.body[i].clone());
                         if i >= 2 && matches!(code.body[i], Instr::Numeric(NumericOp::I32WrapI64)) {
                             if let (Instr::Local(LocalOp::Get, idx1), Instr::Local(LocalOp::Set, idx2)) = (&code.body[i - 1], &code.body[i+1]) {
+                                // Emit the local.set before the check, otherwise the check reads the
+                                // stale value of idx2 instead of the truncated result.
+                                new_instrs.push(code.body[i + 1].clone());
+                                i += 1;
                                 let new_local1 = add_fresh_local(&mut code.locals, func_param_count, ValType::I32);
                                 let new_local2 = add_fresh_local(&mut code.locals, func_param_count, ValType::I64);
                                 new_instrs.push(Instr::Block(BlockType(None)));
@@ -300,6 +326,10 @@ pub fn implicit_unsigned_integer_truncation(input: &str, output: &str) {
                         new_instrs.push(code.body[i].clone());
                         if i >= 2 && matches!(code.body[i], Instr::Numeric(NumericOp::I32WrapI64)) {
                             if let (Instr::Local(LocalOp::Get, idx1), Instr::Local(LocalOp::Set, idx2)) = (&code.body[i - 1], &code.body[i+1]) {
+                                // Emit the local.set before the check, otherwise the check reads the
+                                // stale value of idx2 instead of the truncated result.
+                                new_instrs.push(code.body[i + 1].clone());
+                                i += 1;
                                 let new_local1 = add_fresh_local(&mut code.locals, func_param_count, ValType::I32);
                                 let new_local2 = add_fresh_local(&mut code.locals, func_param_count, ValType::I64);
                                 new_instrs.push(Instr::Block(BlockType(None)));
@@ -831,10 +861,13 @@ pub fn unsigned_integer_overflow(input: &str, output: &str) {
                             (Instr::Local(LocalOp::Get,idx1),
                             Instr::Local(LocalOp::Get,_idx2),
                             Instr::Numeric(NumericOp::I32Add),
-                            Instr::Local(LocalOp::Set,idx3)) => { // I32Add
-                                new_instrs.push(Instr::Local(LocalOp::Tee,*idx3));
+                            Instr::Local(LocalOp::Set,_idx3)) => { // I32Add
+                                // Keep the result in a fresh local: idx3 may alias an operand (e.g. x = x * y),
+                                // so it must not be overwritten before the check reads the operands.
+                                let tmp = add_fresh_local(&mut code.locals, func_param_count, ValType::I32);
+                                new_instrs.push(Instr::Local(LocalOp::Tee, tmp));
                                 new_instrs.push(Instr::Block(BlockType(None)));
-                                    new_instrs.push(Instr::Local(LocalOp::Get, *idx3));
+                                    new_instrs.push(Instr::Local(LocalOp::Get, tmp));
                                     new_instrs.push(Instr::Local(LocalOp::Get, *idx1));
                                     new_instrs.push(Instr::Numeric(NumericOp::I32GeU)); // 若sum >= x, 则直接跳出
                                     new_instrs.push(Instr::BrIf(Label(0)));
@@ -846,10 +879,13 @@ pub fn unsigned_integer_overflow(input: &str, output: &str) {
                             (Instr::Local(LocalOp::Get,idx1),
                             Instr::Local(LocalOp::Get,_idx2),
                             Instr::Numeric(NumericOp::I64Add),
-                            Instr::Local(LocalOp::Set,idx3)) => { // I64Add
-                                new_instrs.push(Instr::Local(LocalOp::Tee,*idx3));
+                            Instr::Local(LocalOp::Set,_idx3)) => { // I64Add
+                                // Keep the result in a fresh local: idx3 may alias an operand (e.g. x = x * y),
+                                // so it must not be overwritten before the check reads the operands.
+                                let tmp = add_fresh_local(&mut code.locals, func_param_count, ValType::I64);
+                                new_instrs.push(Instr::Local(LocalOp::Tee, tmp));
                                 new_instrs.push(Instr::Block(BlockType(None)));
-                                    new_instrs.push(Instr::Local(LocalOp::Get, *idx3));
+                                    new_instrs.push(Instr::Local(LocalOp::Get, tmp));
                                     new_instrs.push(Instr::Local(LocalOp::Get, *idx1));
                                     new_instrs.push(Instr::Numeric(NumericOp::I64GeU)); // 若sum >= x, 则直接跳出
                                     new_instrs.push(Instr::BrIf(Label(0)));
@@ -889,15 +925,18 @@ pub fn unsigned_integer_overflow(input: &str, output: &str) {
                             (Instr::Local(LocalOp::Get,idx1),
                             Instr::Local(LocalOp::Get,idx2),
                             Instr::Numeric(NumericOp::I32Mul),
-                            Instr::Local(LocalOp::Set,idx3)) => { // I32Mul
-                                new_instrs.push(Instr::Local(LocalOp::Tee,*idx3));
+                            Instr::Local(LocalOp::Set,_idx3)) => { // I32Mul
+                                // Keep the result in a fresh local: idx3 may alias an operand (e.g. x = x * y),
+                                // so it must not be overwritten before the check reads the operands.
+                                let tmp = add_fresh_local(&mut code.locals, func_param_count, ValType::I32);
+                                new_instrs.push(Instr::Local(LocalOp::Tee, tmp));
                                 new_instrs.push(Instr::Block(BlockType(None)));
                                     new_instrs.push(Instr::Local(LocalOp::Get, *idx1)); // b
                                     new_instrs.push(Instr::Numeric(NumericOp::I64ExtendI32U)); // 扩展为无符号64位整数
                                     new_instrs.push(Instr::Local(LocalOp::Get, *idx2)); // a 
                                     new_instrs.push(Instr::Numeric(NumericOp::I64ExtendI32U)); // 扩展为无符号64位整数
                                     new_instrs.push(Instr::Numeric(NumericOp::I64Mul));
-                                    new_instrs.push(Instr::Local(LocalOp::Get, *idx3)); 
+                                    new_instrs.push(Instr::Local(LocalOp::Get, tmp)); 
                                     new_instrs.push(Instr::Numeric(NumericOp::I64ExtendI32U)); // 扩展为无符号64位整数
                                     new_instrs.push(Instr::Numeric(NumericOp::I64Eq));
                                     new_instrs.push(Instr::BrIf(Label(0)));
@@ -943,27 +982,27 @@ pub fn signed_integer_overflow(input: &str, output: &str) {
     }
     let i32_add_target_index: Idx<Function> = copy_function("is_i32_sign_add_overflow",
                                                 &mut module,
-                                                SIGNED_INTEGER_OVERFLOW_FUNCS_PATH,)
+                                                SIGNED_INTEGER_OVERFLOW_FUNCS_WASM,)
                                                 .expect("Fail to insert the func!");
     let i64_add_target_index: Idx<Function> = copy_function("is_i64_sign_add_overflow",
                                                 &mut module,
-                                                SIGNED_INTEGER_OVERFLOW_FUNCS_PATH,)
+                                                SIGNED_INTEGER_OVERFLOW_FUNCS_WASM,)
                                                 .expect("Fail to insert the func!");
     let i32_sub_target_index: Idx<Function> = copy_function("is_i32_sign_sub_overflow",
                                                 &mut module,
-                                                SIGNED_INTEGER_OVERFLOW_FUNCS_PATH,)
+                                                SIGNED_INTEGER_OVERFLOW_FUNCS_WASM,)
                                                 .expect("Fail to insert the func!");
     let i64_sub_target_index: Idx<Function> = copy_function("is_i64_sign_sub_overflow",
                                                 &mut module,
-                                                SIGNED_INTEGER_OVERFLOW_FUNCS_PATH,)
+                                                SIGNED_INTEGER_OVERFLOW_FUNCS_WASM,)
                                                 .expect("Fail to insert the func!");
     let i32_mul_target_index: Idx<Function> = copy_function("i32_is_mul_overflow",
                                                 &mut module,
-                                                SIGNED_INTEGER_OVERFLOW_FUNCS_PATH_MUL,)
+                                                SIGNED_INTEGER_OVERFLOW_FUNCS_WASM_MUL,)
                                                 .expect("Fail to insert the func!");
     let i64_mul_target_index: Idx<Function> = copy_function("i64_is_mul_overflow",
                                                 &mut module,
-                                                SIGNED_INTEGER_OVERFLOW_FUNCS_PATH_MUL,)
+                                                SIGNED_INTEGER_OVERFLOW_FUNCS_WASM_MUL,)
                                                 .expect("Fail to insert the func!");
     for (idx, func) in module.functions_mut() {
         let func_param_count = func.param_count();
@@ -1425,6 +1464,19 @@ pub fn float_divide_by_zero(input: &str, output: &str){
     }
 }
 
+/// Heap canary layout of an instrumented allocation (all offsets relative to the chunk returned by
+/// the original allocator):
+///   [0, 4)                  requested size + HEAP_CANARY_EXTRA_BYTES
+///   [4, 8)                  padding
+///   [8, 16)                 first canary
+///   [16, 16 + n)            user data (returned pointer = chunk + 16)
+///   [16 + n, 24 + n)        second canary
+/// The header is 16 bytes so that the returned pointer keeps the 16-byte alignment that malloc must
+/// guarantee on wasm32 (some allocators, e.g. walloc, also check the alignment of freed pointers).
+const HEAP_CANARY_HEADER_BYTES: i32 = 16;
+const HEAP_CANARY_FIRST_CANARY_OFFSET: u32 = 8;
+const HEAP_CANARY_EXTRA_BYTES: i32 = HEAP_CANARY_HEADER_BYTES + 8;
+
 pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
     let result = Module::from_file(input);
     let mut proc_exit_idx: Idx<Function> = Idx::<Function>::from(0);
@@ -1439,6 +1491,33 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                 },
             }
         }
+
+        // TODO detect malloc by other heuristics than by name.
+        // Emscripten names the allocator dlmalloc/dlfree, wasi-libc exposes them directly as malloc/free.
+        // Check for both up front (and that they are defined, not imported), so that we never
+        // instrument malloc without also instrumenting free.
+        let find_defined = |m: &mut Module, names: &[&'static str]| -> Option<&'static str> {
+            names.iter().copied().find(|name| {
+                find_func_by_name(name, m.functions_mut()).map_or(false, |(_, f)| f.code().is_some())
+            })
+        };
+        let malloc_name = find_defined(&mut module, &["dlmalloc", "malloc"]);
+        let free_name = find_defined(&mut module, &["dlfree", "free"]);
+        let (malloc_name, free_name) = match (malloc_name, free_name) {
+            (Some(malloc_name), Some(free_name)) => (malloc_name, free_name),
+            _ => {
+                if malloc_name.is_none() {
+                    log_error!("heap_canary: could not find a defined malloc/dlmalloc function. Skipping instrumentation");
+                }
+                if free_name.is_none() {
+                    log_error!("heap_canary: could not find a defined free/dlfree function. Skipping instrumentation");
+                }
+                // Still write the (unmodified) module, so that chained passes see a valid output.
+                let _ = module.to_file(output).expect("Fail to encode the Wasm Module!");
+                return;
+            }
+        };
+
         // We disable canary checks in calls to free that occur
         // within the realloc function since the block passed to free does not have canary values.
         // Notice, realloc itself performs canary checking at its entry, so this does not
@@ -1460,19 +1539,21 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
             vec![Instr::Const(Val::I32(0)), Instr::End],
         );
 
-        // TODO detect malloc by other heuristics than by name.
-        // Emscripten names the allocator dlmalloc, wasi-libc exposes it directly as malloc.
-        let has_dlmalloc = find_func_by_name("dlmalloc", m.functions_mut()).is_some();
-        let (_, malloc) = find_func_by_name(if has_dlmalloc { "dlmalloc" } else { "malloc" }, m.functions_mut())
-            .expect("Aborting: Could not find malloc function");
+        let (_, malloc) = find_func_by_name(malloc_name, m.functions_mut())
+            .expect("malloc existence was checked above");
 
         let malloc_p0 = get_param_n_idx(malloc, 0);
         let malloc_size = malloc.add_fresh_local(ValType::I32);
 
+        // Turn early returns into branches to an outer block, otherwise they skip the postfix
+        // (canary insertion) below, and free later checks canaries that were never written.
+        // (Same as for calloc and realloc.)
+        returns_to_outer_block_jmp(malloc);
+
         insert_prefix(
             malloc,
-            // preamble for malloc (reserve an extra 20 bytes)
-            // 2 canaries take 16 bytes and the size takes 4 bytes.
+            // preamble for malloc (reserve an extra HEAP_CANARY_EXTRA_BYTES bytes, see the layout
+            // description at HEAP_CANARY_HEADER_BYTES).
             // Notice, we do not reuse the size field from the chunk since
             // 1. it may contain flag bits which we have to account for
             // 2. the returned chunk may the larger than the requested size
@@ -1485,9 +1566,7 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                 Instr::Numeric(NumericOp::I32Eq),
                 Instr::BrIf(Label(0)),
                 Instr::Local(LocalOp::Get, malloc_p0),
-                //TODO do we also need to 16 byte align the heap values?
-                //I don't think that is necessary, but it might be worth while to check.
-                Instr::Const(Val::I32(20)),
+                Instr::Const(Val::I32(HEAP_CANARY_EXTRA_BYTES)),
                 Instr::Numeric(NumericOp::I32Add),
                 // store the size in a fresh local in case the first parameter gets overwritten
                 Instr::Local(LocalOp::Tee, malloc_size),
@@ -1527,14 +1606,14 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                         offset: 0,
                     },
                 ),
-                // store the first canary at byte 4 to 11
+                // store the first canary in the last 8 bytes of the header
                 Instr::Local(LocalOp::Get, tmp_result_local),
                 Instr::Const(Val::I64(0)),
                 Instr::Store(
                     StoreOp::I64Store,
                     Memarg {
                         alignment_exp: 0,
-                        offset: 4,
+                        offset: HEAP_CANARY_FIRST_CANARY_OFFSET,
                     },
                 ),
                 // get the size
@@ -1554,9 +1633,9 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                         offset: 0,
                     },
                 ),
-                // return ptr + 12, i.e., ptr to first element after the first canary.
+                // return ptr + header, i.e., ptr to first element after the first canary.
                 Instr::Local(LocalOp::Get, tmp_result_local),
-                Instr::Const(Val::I32(12)),
+                Instr::Const(Val::I32(HEAP_CANARY_HEADER_BYTES)),
                 Instr::Numeric(NumericOp::I32Add),
                 Instr::End,
             ]);
@@ -1576,9 +1655,8 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
         );
         insert_postfix(malloc, &mut post_fix);
 
-        let has_dlfree = find_func_by_name("dlfree", m.functions_mut()).is_some();
-        let (_, free) = find_func_by_name(if has_dlfree { "dlfree" } else { "free" }, m.functions_mut())
-            .expect("Aborting: Could not find free function");
+        let (_, free) = find_func_by_name(free_name, m.functions_mut())
+            .expect("free existence was checked above");
 
         fn get_canary_check_block(
             chunk_data_ptr: Idx<Local>,
@@ -1598,14 +1676,14 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                 Instr::BrIf(Label(0)),
                 // block to check first canary
                 Instr::Block(BlockType(None)),
-                // decrease ptr by 12
+                // decrease ptr by the header size to get the real chunk ptr
                 Instr::Local(LocalOp::Get, chunk_data_ptr),
-                Instr::Const(Val::I32(12)),
+                Instr::Const(Val::I32(HEAP_CANARY_HEADER_BYTES)),
                 Instr::Numeric(NumericOp::I32Sub),
                 Instr::Local(LocalOp::Set, chunk_data_ptr),
-                // retrieve ptr to first canary (param_0 - 8)
+                // retrieve ptr to first canary
                 Instr::Local(LocalOp::Get, chunk_data_ptr),
-                Instr::Const(Val::I32(4)),
+                Instr::Const(Val::I32(HEAP_CANARY_FIRST_CANARY_OFFSET as i32)),
                 Instr::Numeric(NumericOp::I32Add),
                 // check first parameter
                 Instr::Load(
@@ -1632,7 +1710,7 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                         offset: 0,
                     },
                 ),
-                // get the index of the last data item + 12 bytes (since param 0 is real data ptr + 12)
+                // get the end of the chunk (the size includes header and second canary)
                 Instr::Local(LocalOp::Get, chunk_data_ptr),
                 Instr::Numeric(NumericOp::I32Add),
                 // get the index of the post-chunk canary
@@ -1677,23 +1755,29 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                 let mut realloc_prefix = get_canary_check_block(realloc_p0, disable_canary_glob);
 
                 realloc_prefix.append(&mut vec![
-                    // reserve another 20 bytes for the two canaries and the size
+                    // reserve extra bytes for the header and the second canary
                     Instr::Local(LocalOp::Get, realloc_p1),
-                    Instr::Const(Val::I32(20)),
+                    Instr::Const(Val::I32(HEAP_CANARY_EXTRA_BYTES)),
                     Instr::Numeric(NumericOp::I32Add),
                     Instr::Local(LocalOp::Tee, realloc_size),
                     Instr::Local(LocalOp::Set, realloc_p1),
                     // disable canary checking while the body of realloc is executing
                     Instr::Const(Val::I32(1)),
                     Instr::Global(GlobalOp::Set, disable_canary_glob),
+                    // also disable canary insertion in malloc: realloc may be implemented via
+                    // malloc + copy + free, and the result would otherwise get two headers.
+                    Instr::Const(Val::I32(1)),
+                    Instr::Global(GlobalOp::Set, disable_canary_insertion_in_malloc),
                 ]);
                 insert_prefix(realloc, realloc_prefix);
 
                 // reuse the malloc postfix
                 let mut post_fix = get_malloc_postfix(realloc, realloc_size, None);
-                // re-enable the canary checking
+                // re-enable the canary checking and insertion
                 post_fix.push(Instr::Const(Val::I32(0)));
                 post_fix.push(Instr::Global(GlobalOp::Set, disable_canary_glob));
+                post_fix.push(Instr::Const(Val::I32(0)));
+                post_fix.push(Instr::Global(GlobalOp::Set, disable_canary_insertion_in_malloc));
                 insert_postfix(realloc, &mut post_fix);
             }
             None => println!("realloc not detected. Skipping instrumentation"),
@@ -1745,9 +1829,9 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
                     Instr::Local(LocalOp::Set, calloc_p1),
                     Instr::Const(Val::I32(1)),
                     Instr::Local(LocalOp::Set, calloc_p0),
-                    // reserve another 20 bytes for canaries and size
+                    // reserve extra bytes for the header and the second canary
                     Instr::Local(LocalOp::Get, calloc_p1),
-                    Instr::Const(Val::I32(20)),
+                    Instr::Const(Val::I32(HEAP_CANARY_EXTRA_BYTES)),
                     Instr::Numeric(NumericOp::I32Add),
                     Instr::Local(LocalOp::Tee, calloc_size),
                     Instr::Local(LocalOp::Set, calloc_p1),

@@ -366,6 +366,27 @@ pub enum Instr {
     #[tag = 0xc2] I64Extend8S,
     #[tag = 0xc3] I64Extend16S,
     #[tag = 0xc4] I64Extend32S,
+
+    // Instructions with 0xfc prefix (non-trapping float-to-int conversions, bulk memory).
+    #[tag = 0xfc] Prefixed(PrefixedInstr),
+}
+
+/// Instructions following the 0xfc prefix byte.
+// NOTE The sub-opcode is formally a LEB128 u32, but all defined values are < 0x80, so in canonical
+// encoding it is a single byte and can be handled as a regular tag.
+#[derive(WasmBinary, Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum PrefixedInstr {
+    #[tag = 0x00] I32TruncSatF32S,
+    #[tag = 0x01] I32TruncSatF32U,
+    #[tag = 0x02] I32TruncSatF64S,
+    #[tag = 0x03] I32TruncSatF64U,
+    #[tag = 0x04] I64TruncSatF32S,
+    #[tag = 0x05] I64TruncSatF32U,
+    #[tag = 0x06] I64TruncSatF64S,
+    #[tag = 0x07] I64TruncSatF64U,
+
+    #[tag = 0x0a] MemoryCopy(/* destination */ Idx<Memory>, /* source */ Idx<Memory>),
+    #[tag = 0x0b] MemoryFill(Idx<Memory>),
 }
 
 /* Important/widely supported custom sections */

@@ -177,6 +177,8 @@ pub enum Instr {
 
     MemorySize(Idx<Memory>),
     MemoryGrow(Idx<Memory>),
+    MemoryCopy(/* destination */ Idx<Memory>, /* source */ Idx<Memory>),
+    MemoryFill(Idx<Memory>),
 
     Const(Val),
     Numeric(NumericOp),
@@ -258,6 +260,10 @@ pub enum NumericOp {
     I32TruncF32U,
     I32TruncF64S,
     I32TruncF64U,
+    I32TruncSatF32S,
+    I32TruncSatF32U,
+    I32TruncSatF64S,
+    I32TruncSatF64U,
 
     I64ExtendI32S,
     I64ExtendI32U,
@@ -265,6 +271,10 @@ pub enum NumericOp {
     I64TruncF32U,
     I64TruncF64S,
     I64TruncF64U,
+    I64TruncSatF32S,
+    I64TruncSatF32U,
+    I64TruncSatF64S,
+    I64TruncSatF64U,
 
     F32ConvertI32S,
     F32ConvertI32U,
@@ -417,9 +427,13 @@ impl NumericOp {
             I32WrapI64 => FunctionType::new(&[I64], &[I32]),
             I32TruncF32S | I32TruncF32U => FunctionType::new(&[F32], &[I32]),
             I32TruncF64S | I32TruncF64U => FunctionType::new(&[F64], &[I32]),
+            I32TruncSatF32S | I32TruncSatF32U => FunctionType::new(&[F32], &[I32]),
+            I32TruncSatF64S | I32TruncSatF64U => FunctionType::new(&[F64], &[I32]),
             I64ExtendI32S | I64ExtendI32U => FunctionType::new(&[I32], &[I64]),
             I64TruncF32S | I64TruncF32U => FunctionType::new(&[F32], &[I64]),
             I64TruncF64S | I64TruncF64U => FunctionType::new(&[F64], &[I64]),
+            I64TruncSatF32S | I64TruncSatF32U => FunctionType::new(&[F32], &[I64]),
+            I64TruncSatF64S | I64TruncSatF64U => FunctionType::new(&[F64], &[I64]),
             F32ConvertI32S | F32ConvertI32U => FunctionType::new(&[I32], &[F32]),
             F32ConvertI64S | F32ConvertI64U => FunctionType::new(&[I64], &[F32]),
             F32DemoteF64 => FunctionType::new(&[F64], &[F32]),
@@ -550,6 +564,7 @@ impl Instr {
             Store(ref op, _) => Some(op.to_type()),
             MemorySize(_) => Some(FunctionType::new(&[], &[I32])),
             MemoryGrow(_) => Some(FunctionType::new(&[I32], &[I32])),
+            MemoryCopy(_, _) | MemoryFill(_) => Some(FunctionType::new(&[I32, I32, I32], &[])),
             Const(ref val) => Some(FunctionType::new(&[], &[val.to_type()])),
             Numeric(ref op) => Some(op.to_type()),
             CallIndirect(ref func_ty, _) => Some(FunctionType::new(&[&func_ty.params[..], &[I32]].concat(), &func_ty.results)),
@@ -596,6 +611,8 @@ impl Instr {
             Global(GlobalOp::Set, _) => "global.set",
             MemorySize(_) => "memory.size",
             MemoryGrow(_) => "memory.grow",
+            MemoryCopy(_, _) => "memory.copy",
+            MemoryFill(_) => "memory.fill",
             Const(Val::I32(_)) => "i32.const",
             Const(Val::I64(_)) => "i64.const",
             Const(Val::F32(_)) => "f32.const",
@@ -650,12 +667,20 @@ impl Instr {
             Numeric(I32TruncF32U) => "i32.trunc_f32_u",
             Numeric(I32TruncF64S) => "i32.trunc_f64_s",
             Numeric(I32TruncF64U) => "i32.trunc_f64_u",
+            Numeric(I32TruncSatF32S) => "i32.trunc_sat_f32_s",
+            Numeric(I32TruncSatF32U) => "i32.trunc_sat_f32_u",
+            Numeric(I32TruncSatF64S) => "i32.trunc_sat_f64_s",
+            Numeric(I32TruncSatF64U) => "i32.trunc_sat_f64_u",
             Numeric(I64ExtendI32S) => "i64.extend_i32_s",
             Numeric(I64ExtendI32U) => "i64.extend_i32_u",
             Numeric(I64TruncF32S) => "i64.trunc_f32_s",
             Numeric(I64TruncF32U) => "i64.trunc_f32_u",
             Numeric(I64TruncF64S) => "i64.trunc_f64_s",
             Numeric(I64TruncF64U) => "i64.trunc_f64_u",
+            Numeric(I64TruncSatF32S) => "i64.trunc_sat_f32_s",
+            Numeric(I64TruncSatF32U) => "i64.trunc_sat_f32_u",
+            Numeric(I64TruncSatF64S) => "i64.trunc_sat_f64_s",
+            Numeric(I64TruncSatF64U) => "i64.trunc_sat_f64_u",
             Numeric(F32ConvertI32S) => "f32.convert_i32_s",
             Numeric(F32ConvertI32U) => "f32.convert_i32_u",
             Numeric(F32ConvertI64S) => "f32.convert_i64_s",
@@ -769,7 +794,7 @@ impl fmt::Display for Instr {
             // TODO not sure if we should print block types if non-empty?
             | Block(_) | Loop(_) | If(_)
             | Else | End
-            | MemorySize(_) | MemoryGrow(_)
+            | MemorySize(_) | MemoryGrow(_) | MemoryCopy(_, _) | MemoryFill(_)
             | Numeric(_) => Ok(()),
 
             Br(label) => write!(f, " {}", label.0),

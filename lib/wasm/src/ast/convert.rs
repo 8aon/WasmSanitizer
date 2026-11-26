@@ -415,6 +415,17 @@ fn from_lowlevel_instr(instr: ll::Instr, types: &[FunctionType]) -> hl::Instr {
         ll::Instr::I64Extend16S => hl::Instr::Numeric(hl::NumericOp::I64Extend16S),
         ll::Instr::I64Extend32S => hl::Instr::Numeric(hl::NumericOp::I64Extend32S),
 
+        // 0xfc prefixed instructions
+        ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF32S) => hl::Instr::Numeric(hl::NumericOp::I32TruncSatF32S),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF32U) => hl::Instr::Numeric(hl::NumericOp::I32TruncSatF32U),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF64S) => hl::Instr::Numeric(hl::NumericOp::I32TruncSatF64S),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF64U) => hl::Instr::Numeric(hl::NumericOp::I32TruncSatF64U),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF32S) => hl::Instr::Numeric(hl::NumericOp::I64TruncSatF32S),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF32U) => hl::Instr::Numeric(hl::NumericOp::I64TruncSatF32U),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF64S) => hl::Instr::Numeric(hl::NumericOp::I64TruncSatF64S),
+        ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF64U) => hl::Instr::Numeric(hl::NumericOp::I64TruncSatF64U),
+        ll::Instr::Prefixed(ll::PrefixedInstr::MemoryCopy(dst_memory_idx, src_memory_idx)) => hl::Instr::MemoryCopy(dst_memory_idx.into_inner().into(), src_memory_idx.into_inner().into()),
+        ll::Instr::Prefixed(ll::PrefixedInstr::MemoryFill(memory_idx)) => hl::Instr::MemoryFill(memory_idx.into_inner().into()),
     }
 }
 
@@ -955,5 +966,17 @@ fn to_lowlevel_instr(instr: &hl::Instr, state: &EncodeState) -> ll::Instr {
         hl::Instr::Numeric(hl::NumericOp::I64Extend8S) => ll::Instr::I64Extend8S,
         hl::Instr::Numeric(hl::NumericOp::I64Extend16S) => ll::Instr::I64Extend16S,
         hl::Instr::Numeric(hl::NumericOp::I64Extend32S) => ll::Instr::I64Extend32S,
+
+        // 0xfc prefixed instructions
+        hl::Instr::Numeric(hl::NumericOp::I32TruncSatF32S) => ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF32S),
+        hl::Instr::Numeric(hl::NumericOp::I32TruncSatF32U) => ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF32U),
+        hl::Instr::Numeric(hl::NumericOp::I32TruncSatF64S) => ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF64S),
+        hl::Instr::Numeric(hl::NumericOp::I32TruncSatF64U) => ll::Instr::Prefixed(ll::PrefixedInstr::I32TruncSatF64U),
+        hl::Instr::Numeric(hl::NumericOp::I64TruncSatF32S) => ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF32S),
+        hl::Instr::Numeric(hl::NumericOp::I64TruncSatF32U) => ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF32U),
+        hl::Instr::Numeric(hl::NumericOp::I64TruncSatF64S) => ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF64S),
+        hl::Instr::Numeric(hl::NumericOp::I64TruncSatF64U) => ll::Instr::Prefixed(ll::PrefixedInstr::I64TruncSatF64U),
+        hl::Instr::MemoryCopy(dst_memory_idx, src_memory_idx) => ll::Instr::Prefixed(ll::PrefixedInstr::MemoryCopy(state.map_memory_idx(dst_memory_idx), state.map_memory_idx(src_memory_idx))),
+        hl::Instr::MemoryFill(memory_idx) => ll::Instr::Prefixed(ll::PrefixedInstr::MemoryFill(state.map_memory_idx(memory_idx))),
     }
 }

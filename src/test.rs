@@ -13,10 +13,10 @@ use wasm::highlevel::{Global, GlobalOp, Instr, LoadOp, LocalOp, Module, Function
     Local, ImportOrPresent, StoreOp};
 use wasm::{BlockType, FunctionType, Idx, Label, Memarg, Mutability, Val, ValType};
 
-const SIGNED_INTEGER_OVERFLOW_FUNCS_PATH: &str = 
-"/home/WORK/PAPER2/rust-wasm-instrumentation/funcs/signed_integer_overflow.wasm";
-const SIGNED_INTEGER_OVERFLOW_FUNCS_PATH_MUL: &str = 
-"/home/WORK/PAPER2/rust-wasm-instrumentation/funcs/mul_check.wasm";
+const SIGNED_INTEGER_OVERFLOW_FUNCS_PATH: &str =
+concat!(env!("CARGO_MANIFEST_DIR"), "/funcs/signed_integer_overflow.wasm");
+const SIGNED_INTEGER_OVERFLOW_FUNCS_PATH_MUL: &str =
+concat!(env!("CARGO_MANIFEST_DIR"), "/funcs/mul_check.wasm");
 const SIGNED_INTEGER_OVERFLOW_FUNCS: [&str; 6] = 
 ["is_i32_sign_add_overflow","is_i64_sign_add_overflow",
 "is_i32_sign_sub_overflow","is_i64_sign_sub_overflow",
@@ -172,11 +172,11 @@ pub fn null_reference(input: &str, output: &str) {
                                 let new_local1 = add_fresh_local(&mut code.locals, func_param_count, ValType::I32);
                                 new_instrs.push(Instr::Local(LocalOp::Get, *idx1));
                                 new_instrs.push(Instr::Const(Val::I32(0)));
-                                new_instrs.push(Instr::Numeric(NumericOp::I32Eq));
+                                new_instrs.push(Instr::Numeric(NumericOp::I32Ne));
                                 new_instrs.push(Instr::Local(LocalOp::Set, new_local1));
                                 new_instrs.push(Instr::Block(BlockType(None)));
                                     new_instrs.push(Instr::Local(LocalOp::Get, new_local1));
-                                    new_instrs.push(Instr::BrIf(Label(0))); // 没有溢出，跳出 
+                                    new_instrs.push(Instr::BrIf(Label(0))); // 地址非空，跳出
                                     //new_instrs.push(Instr::Const(Val::I32(11))); // return 11
                                     //new_instrs.push(Instr::Call(proc_exit_idx));                                
                                     new_instrs.push(Instr::Unreachable);
@@ -1461,7 +1461,9 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
         );
 
         // TODO detect malloc by other heuristics than by name.
-        let (_, malloc) = find_func_by_name("dlmalloc", m.functions_mut())
+        // Emscripten names the allocator dlmalloc, wasi-libc exposes it directly as malloc.
+        let has_dlmalloc = find_func_by_name("dlmalloc", m.functions_mut()).is_some();
+        let (_, malloc) = find_func_by_name(if has_dlmalloc { "dlmalloc" } else { "malloc" }, m.functions_mut())
             .expect("Aborting: Could not find malloc function");
 
         let malloc_p0 = get_param_n_idx(malloc, 0);
@@ -1574,7 +1576,8 @@ pub fn instrument_with_heap_canary_check(input: &str, output: &str) {
         );
         insert_postfix(malloc, &mut post_fix);
 
-        let (_, free) = find_func_by_name("dlfree", m.functions_mut())
+        let has_dlfree = find_func_by_name("dlfree", m.functions_mut()).is_some();
+        let (_, free) = find_func_by_name(if has_dlfree { "dlfree" } else { "free" }, m.functions_mut())
             .expect("Aborting: Could not find free function");
 
         fn get_canary_check_block(
